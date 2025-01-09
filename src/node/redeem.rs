@@ -557,12 +557,13 @@ impl<J: Jet> RedeemNode<J> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use hex::DisplayHex;
-    use std::fmt;
-
+    use crate::human_encoding::Forest;
     use crate::jet::Core;
     use crate::node::SimpleFinalizer;
+    use crate::types::Final;
+    use hex::DisplayHex;
+    use std::collections::HashMap;
+    use std::fmt;
 
     fn assert_program_deserializable<J: Jet>(
         prog_bytes: &[u8],
@@ -886,5 +887,102 @@ mod tests {
             "ec97c8774cb6bfb381fdbbcc8d964380fb3a3b45779322624490d6231ae777a4",
             "ad7c38b16b9129646dc89b52cff144de94a80e383c4983b53de65e3575abcf38",
         );
+    }
+
+    #[cfg(feature = "elements")]
+    fn assert_correct_pruning<J: Jet>(
+        unpruned: &str,
+        expected_pruning_result: &str,
+        witness: &HashMap<Arc<str>, Value>,
+        env: &J::Environment,
+    ) {
+        let unpruned_program = Forest::<J>::parse(unpruned)
+            .expect("unpruned program should parse")
+            .to_witness_node(witness)
+            .expect("unpruned program should have main")
+            .finalize_unpruned()
+            .expect("unpruned program should finalize");
+        let expected_unpruned_program = Forest::<J>::parse(expected_pruning_result)
+            .expect("expected pruned program should parse")
+            .to_witness_node(witness)
+            .expect("expected pruned program should have main")
+            .finalize_unpruned()
+            .expect("expected pruned program should finalize");
+
+        let mut mac = BitMachine::for_program(&unpruned_program);
+        let unpruned_output = mac
+            .exec(&unpruned_program, env)
+            .expect("unpruned program should run without failure");
+
+        let pruned_program = unpruned_program
+            .prune(env)
+            .expect("pruning should not fail if execution succeeded");
+        assert_eq!(
+            pruned_program.imr(),
+            expected_unpruned_program.imr(),
+            "pruning result differs from expected result"
+        );
+
+        let mut mac = BitMachine::for_program(&pruned_program);
+        let pruned_output = mac
+            .exec(&pruned_program, env)
+            .expect("pruned program should run without failure");
+        assert_eq!(
+            unpruned_output, pruned_output,
+            "pruned program should return same output as unpruned program"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "elements")]
+    fn prune() {
+        let env = crate::jet::elements::ElementsEnv::dummy();
+        let prune_product = r#"wit1 := witness : 1 -> 2
+wit2 := witness : 1 -> 2^64 * 2^64
+input := pair wit1 wit2 : 1 -> 2 * (2^64 * 2^64)
+process := case (drop take jet_is_zero_64) (drop drop jet_is_zero_64) : 2 * (2^64 * 2^64) -> 2
+main := comp input comp process jet_verify : 1 -> 1"#;
+
+        let pruned_right = r#"wit1 := witness : 1 -> 2
+wit2 := witness : 1 -> 2^64 * 1 -- right component was pruned
+input := pair wit1 wit2 : 1 -> 2 * (2^64 * 1)
+process := assertl (drop take jet_is_zero_64) #{drop drop jet_is_zero_64} : 2 * (2^64 * 1) -> 2 -- case became assertl
+main := comp input comp process jet_verify : 1 -> 1"#;
+        let mut witness = HashMap::from([
+            (Arc::from("wit1"), Value::u1(0)),
+            (
+                Arc::from("wit2"),
+                Value::product(Value::u64(0), Value::u64(0)),
+            ),
+        ]);
+        assert_correct_pruning::<crate::jet::Elements>(prune_product, pruned_right, &witness, &env);
+
+        let pruned_left = r#"wit1 := witness : 1 -> 2
+wit2 := witness : 1 -> 1 * 2^64 -- left component was pruned
+input := pair wit1 wit2 : 1 -> 2 * (1 * 2^64)
+process := assertr #{drop take jet_is_zero_64} (drop drop jet_is_zero_64) : 2 * (1 * 2^64) -> 2 -- case became assertr
+main := comp input comp process jet_verify : 1 -> 1"#;
+        witness.insert(Arc::from("wit1"), Value::u1(1));
+        assert_correct_pruning::<crate::jet::Elements>(prune_product, pruned_left, &witness, &env);
+
+        let prune_sum = r#"wit1 := witness : 1 -> 2^64 + 2^64
+input := pair wit1 unit : 1 -> (2^64 + 2^64) * 1
+process := case (take jet_is_zero_64) (take jet_is_zero_64) : (2^64 + 2^64) * 1 -> 2
+main := comp input comp process jet_verify : 1 -> 1"#;
+
+        let pruned_right = r#"wit1 := witness : 1 -> 2^64 + 1 -- right sub type became unit
+input := pair wit1 unit : 1 -> (2^64 + 1) * 1
+process := assertl (take jet_is_zero_64) #{take jet_is_zero_64} : (2^64 + 1) * 1 -> 2 -- case became assertl
+main := comp input comp process jet_verify : 1 -> 1"#;
+        let mut witness =
+            HashMap::from([(Arc::from("wit1"), Value::left(Value::u64(0), Final::u64()))]);
+        assert_correct_pruning::<crate::jet::Elements>(prune_sum, pruned_right, &witness, &env);
+
+        let pruned_left = r#"wit1 := witness : 1 -> 1 + 2^64 -- left sub type became unit
+input := pair wit1 unit : 1 -> (1 + 2^64) * 1
+process := assertr #{take jet_is_zero_64} (take jet_is_zero_64) : (1 + 2^64) * 1 -> 2 -- case became assertr
+main := comp input comp process jet_verify : 1 -> 1"#;
+        witness.insert(Arc::from("wit1"), Value::right(Final::u64(), Value::u64(0)));
+        assert_correct_pruning::<crate::jet::Elements>(prune_sum, pruned_left, &witness, &env);
     }
 }
